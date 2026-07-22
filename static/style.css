@@ -374,6 +374,41 @@ body {
     background: rgba(0, 0, 0, 0.4);
 }
 
+.toggle-password {
+    position: absolute;
+    right: 12px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 1.1rem;
+    padding: 5px;
+    opacity: 0.6;
+    transition: var(--transition-smooth);
+}
+
+.toggle-password:hover {
+    opacity: 1;
+}
+
+.password-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+.forgot-password-link {
+    font-size: 0.85rem;
+    color: var(--primary-color);
+    text-decoration: none;
+    font-weight: 500;
+    transition: var(--transition-smooth);
+}
+
+.forgot-password-link:hover {
+    text-decoration: underline;
+    color: var(--purple-color);
+}
+
 .auth-footer {
     margin-top: 25px;
     text-align: center;

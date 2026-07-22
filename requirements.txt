@@ -1,7 +1,10 @@
 Flask
 Flask-Login
 Flask-SQLAlchemy
+Flask-Mail
+python-dotenv
 pandas
 numpy
 reportlab
 gunicorn
+psycopg2-binary

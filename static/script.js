@@ -40,7 +40,7 @@ let gainNode = null;
 let alarmPlaying = false;
 
 // Calibration & Sensitivity Defaults
-let DROWSINESS_THRESHOLD = parseFloat(localStorage.getItem('drowsinessThreshold')) || 0.25;
+let DROWSINESS_THRESHOLD = parseFloat(localStorage.getItem('drowsinessThreshold')) || 0.12;
 sensitivityInput.value = DROWSINESS_THRESHOLD;
 sensitivityValue.textContent = DROWSINESS_THRESHOLD.toFixed(2);
 
@@ -51,7 +51,7 @@ const PITCH_THRESHOLD_DOWN = 1.35; // head looking down
 // Tracking counters & metrics
 let frameCounter = 0;
 let consecutiveDrowsyFrames = 0;
-const FRAMES_TO_TRIGGER = 6; // ~0.5 seconds of consecutive closure
+const FRAMES_TO_TRIGGER = 20; // ~1.5 seconds of consecutive closure (reduced false positives)
 
 // Session cumulative variables
 let sessionStartTime = null;
@@ -173,6 +173,7 @@ calibrateBtn.addEventListener('click', () => {
 // --- WAKE UP INTERACTIVE CHALLENGES SYSTEM ---
 let currentChallengeType = null;
 let isChallengeActive = false;
+let challengeCooldownUntil = 0; // Timestamp until which challenges are blocked
 
 // Challenge Variables
 let mathAnswer = 0;
@@ -184,6 +185,11 @@ const SMILE_FRAMES_REQUIRED = 20; // hold smile for 20 frames (~1.5s)
 
 function showChallenge() {
     if (isChallengeActive) return;
+    
+    // Check cooldown
+    const now = Date.now();
+    if (now < challengeCooldownUntil) return;
+    
     isChallengeActive = true;
     startAlarm();
     
@@ -413,6 +419,9 @@ function dismissChallenge() {
     currentChallengeType = null;
     consecutiveDrowsyFrames = 0;
     stopAlarm();
+
+    // Set 5 second cooldown to prevent immediate re-triggering
+    challengeCooldownUntil = Date.now() + 5000;
 
     statusText.innerText = "Monitoring";
     statusLight.className = "light green";

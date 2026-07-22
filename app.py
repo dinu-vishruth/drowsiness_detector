@@ -5,16 +5,45 @@ from datetime import datetime, date, timedelta
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, make_response
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash
+from flask_mail import Mail, Message
+from dotenv import load_dotenv
 
 from reports import generate_pdf_report, generate_csv_report
 from recommendations import analyze_user_sessions
 
 from database import db, User, Session, AlertEvent, Achievement, ACHIEVEMENT_DEFINITIONS, init_db
 
+# Load environment variables from .env file
+load_dotenv()
+
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'antigravity-drowsiness-secret-key-9988')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///drowsiness.db')
+
+# Database configuration: Use PostgreSQL on Render, SQLite locally with absolute path
+database_url = os.environ.get('DATABASE_URL')
+if database_url and database_url.startswith('postgres'):
+    # Render PostgreSQL - fix for postgres:// vs postgresql://
+    if database_url.startswith('postgres://'):
+        database_url = database_url.replace('postgres://', 'postgresql://', 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+else:
+    # Local development - use absolute path in instance folder
+    instance_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance')
+    os.makedirs(instance_path, exist_ok=True)
+    db_path = os.path.join(instance_path, 'drowsiness.db')
+    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Email configuration for password reset
+app.config['MAIL_SERVER'] = os.environ.get('MAIL_SERVER', 'smtp.gmail.com')
+app.config['MAIL_PORT'] = int(os.environ.get('MAIL_PORT', 587))
+app.config['MAIL_USE_TLS'] = os.environ.get('MAIL_USE_TLS', 'true').lower() == 'true'
+app.config['MAIL_USERNAME'] = os.environ.get('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.environ.get('MAIL_PASSWORD')
+app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_DEFAULT_SENDER', 'noreply@drowsinessdetector.com')
+
+mail = Mail(app)
 
 # Initialize DB
 init_db(app)
@@ -92,6 +121,96 @@ def logout():
     logout_user()
     flash('You have been logged out.', 'success')
     return redirect(url_for('login'))
+
+@app.route('/forgot-password', methods=['GET', 'POST'])
+def forgot_password():
+    if request.method == 'POST':
+        email = request.form.get('email', '').strip()
+        user = User.query.filter_by(email=email).first()
+        
+        if user:
+            # Generate reset token
+            token = user.generate_reset_token()
+            reset_url = url_for('reset_password', token=token, _external=True)
+            
+            # Send email
+            try:
+                msg = Message(
+                    'Password Reset Request - Drowsiness Prevention System',
+                    recipients=[user.email]
+                )
+                msg.body = f'''
+Hello {user.username},
+
+You requested a password reset. Click the link below to reset your password:
+
+{reset_url}
+
+This link will expire in 1 hour.
+
+If you did not request this, please ignore this email.
+
+Best regards,
+Drowsiness Prevention System
+'''
+                mail.send(msg)
+                flash('Password reset link has been sent to your email.', 'success')
+            except Exception as e:
+                flash('Failed to send email. Please try again later.', 'error')
+                print(f"Email error: {e}")
+        else:
+            # Don't reveal if email exists or not for security
+            flash('If an account with that email exists, a reset link has been sent.', 'info')
+        
+        return redirect(url_for('login'))
+    
+    return render_template('forgot_password.html', active_page='login')
+
+@app.route('/reset-password/<token>', methods=['GET', 'POST'])
+def reset_password(token):
+    user = User.query.filter_by(reset_token=token).first()
+    
+    if not user or not user.verify_reset_token(token):
+        flash('Invalid or expired reset link. Please request a new one.', 'error')
+        return redirect(url_for('forgot_password'))
+    
+    if request.method == 'POST':
+        password = request.form.get('password', '')
+        confirm_password = request.form.get('confirm_password', '')
+        
+        if not password or not confirm_password:
+            flash('Please fill out all fields.', 'error')
+            return redirect(url_for('reset_password', token=token))
+        
+        if password != confirm_password:
+            flash('Passwords do not match.', 'error')
+            return redirect(url_for('reset_password', token=token))
+        
+        # Validate password strength
+        if len(password) < 8:
+            flash('Password must be at least 8 characters long.', 'error')
+            return redirect(url_for('reset_password', token=token))
+        
+        if not any(c.isupper() for c in password):
+            flash('Password must contain at least one uppercase letter.', 'error')
+            return redirect(url_for('reset_password', token=token))
+        
+        if not any(c.islower() for c in password):
+            flash('Password must contain at least one lowercase letter.', 'error')
+            return redirect(url_for('reset_password', token=token))
+        
+        if not any(c.isdigit() for c in password):
+            flash('Password must contain at least one number.', 'error')
+            return redirect(url_for('reset_password', token=token))
+        
+        # Update password
+        user.set_password(password)
+        user.clear_reset_token()
+        
+        flash('Password has been reset successfully. Please sign in with your new password.', 'success')
+        return redirect(url_for('login'))
+    
+    return render_template('reset_password.html', token=token, active_page='login')
 
 @app.route('/')
 def index():
@@ -443,5 +562,6 @@ if __name__ == '__main__':
             db.session.add(dev)
             db.session.commit()
             print("Default developer user initialized: developer / developer123")
-            
-    app.run(debug=True, port=5000)
+
+    port = int(os.environ.get('PORT', 80))
+    app.run(host="0.0.0.0", debug=True, port=port)
