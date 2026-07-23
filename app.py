@@ -17,7 +17,7 @@ from database import db, User, Session, AlertEvent, Achievement, ACHIEVEMENT_DEF
 load_dotenv()
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'antigravity-drowsiness-secret-key-9988')
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'drowsiness-detector-secret-key-9988')
 
 # Database configuration: Use PostgreSQL on Render, SQLite locally with absolute path
 database_url = os.environ.get('DATABASE_URL')
@@ -557,11 +557,10 @@ if __name__ == '__main__':
     # Build a default test account if needed
     with app.app_context():
         if User.query.filter_by(username='developer').first() is None:
-            dev = User(username='developer', email='developer@antigravity.alert')
+            dev = User(username='developer', email='developer@drowsinessdetector.com')
             dev.set_password('developer123')
             db.session.add(dev)
             db.session.commit()
-            print("Default developer user initialized: developer / developer123")
 
     port = int(os.environ.get('PORT', 80))
-    app.run(host="0.0.0.0", debug=True, port=port)
+app.run(host="0.0.0.0", debug=True, use_reloader=False, port=port)

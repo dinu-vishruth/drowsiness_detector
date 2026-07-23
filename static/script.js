@@ -181,7 +181,7 @@ let memorySeq = [];
 let userMemoryInput = [];
 let reactionClicksRemaining = 3;
 let smileFramesCount = 0;
-const SMILE_FRAMES_REQUIRED = 20; // hold smile for 20 frames (~1.5s)
+const SMILE_FRAMES_REQUIRED = 250; // about 10 seconds of steady, moderate smiling
 
 function showChallenge() {
     if (isChallengeActive) return;
@@ -196,6 +196,9 @@ function showChallenge() {
     challengeFeedback.classList.add('hidden');
     challengeFeedback.className = 'challenge-feedback';
     challengeModal.classList.remove('hidden');
+    overlayMessage.classList.add('hidden');
+    document.getElementById('overlay-title').innerText = 'WAKE UP!';
+    document.getElementById('overlay-desc').innerText = 'Stay alert and complete the challenge.';
     
     // Pick random challenge type: math, memory, reaction, smile
     const challenges = ['math', 'memory', 'reaction', 'smile'];
@@ -221,7 +224,7 @@ function setupChallenge(type) {
         
         challengeArea.innerHTML = `
             <div class="math-expression">${num1} ${operator} ${num2} = ?</div>
-            <input type="number" id="math-input-box" class="math-input" placeholder="Result" autofocus>
+            <input type="number" id="math-input-box" class="math-input" autofocus>
             <button id="math-submit" class="btn primary" style="margin-top: 15px;">Verify Answer</button>
         `;
         
@@ -287,13 +290,15 @@ function setupChallenge(type) {
         challengeArea.innerHTML = `
             <div class="pose-challenge-status">
                 <span style="font-size:2.5rem;">😊</span>
-                <p style="font-weight:600; color:#00f2ea;">Smile broadly into the camera!</p>
-                <p style="font-size:0.8rem; color:#aaa;">Hold it to fill the bar</p>
+                <p style="font-weight:600; color:#00f2ea;">Hold a medium smile into the camera!</p>
+                <p style="font-size:0.8rem; color:#aaa;">Keep it steady for about 10 seconds</p>
                 <div class="pose-progress-track">
                     <div id="pose-progress-fill" class="pose-progress-fill"></div>
                 </div>
             </div>
         `;
+        const progressFill = document.getElementById('pose-progress-fill');
+        if (progressFill) progressFill.style.width = '0%';
     }
 }
 
@@ -363,40 +368,47 @@ function relocateTarget() {
 
 // Smile verification runs on facial landmarks loop
 function checkSmileChallenge(landmarks) {
-    // Left corner 78, Right corner 308
-    // Outer eye corners 33, 263
-    const leftCorner = landmarks[78];
-    const rightCorner = landmarks[308];
-    const leftEye = landmarks[33];
-    const rightEye = landmarks[263];
-    
-    const mouthWidth = getDistance(leftCorner, rightCorner);
-    const eyeWidth = getDistance(leftEye, rightEye);
-    
-    if (eyeWidth === 0) return;
-    const smileRatio = mouthWidth / eyeWidth;
-    
     const progressFill = document.getElementById('pose-progress-fill');
-    
-    // Smiling when mouth is stretched wide relative to distance between eyes
-    if (smileRatio > 0.65) {
-        smileFramesCount++;
-        if (progressFill) {
-            const pct = Math.min(100, (smileFramesCount / SMILE_FRAMES_REQUIRED) * 100);
-            progressFill.style.width = `${pct}%`;
-        }
-        
-        if (smileFramesCount >= SMILE_FRAMES_REQUIRED) {
-            showChallengeFeedback(true, "Perfect smile detected!");
-            setTimeout(dismissChallenge, 1000);
-        }
-    } else {
-        // Slow decay if they stop smiling
-        if (smileFramesCount > 0) smileFramesCount--;
-        if (progressFill) {
-            const pct = Math.min(100, (smileFramesCount / SMILE_FRAMES_REQUIRED) * 100);
-            progressFill.style.width = `${pct}%`;
-        }
+    if (!progressFill || !landmarks) return;
+
+    const leftEye = landmarks[33] || landmarks[133];
+    const rightEye = landmarks[263] || landmarks[362];
+    const mouthLeft = landmarks[61] || landmarks[78];
+    const mouthRight = landmarks[291] || landmarks[308];
+    const upperLip = landmarks[13] || landmarks[0];
+    const lowerLip = landmarks[14] || landmarks[17];
+
+    if (!leftEye || !rightEye || !mouthLeft || !mouthRight || !upperLip || !lowerLip) return;
+
+    const eyeWidth = getDistance(leftEye, rightEye);
+    const mouthWidth = getDistance(mouthLeft, mouthRight);
+    const mouthHeight = getDistance(upperLip, lowerLip);
+
+    if (eyeWidth === 0) return;
+
+    const smileRatio = mouthWidth / eyeWidth;
+    const mouthLift = ((leftEye.y + rightEye.y) / 2) - ((mouthLeft.y + mouthRight.y) / 2);
+    const smileStrength = Math.max(0, Math.min(1,
+        (smileRatio - 0.45) * 1.15 + Math.max(0, mouthLift) * 1.8 + (mouthHeight > 0.003 ? 0.05 : 0)
+    ));
+
+    if (smileStrength > 0.22 && mouthHeight > 0.0025) {
+        smileFramesCount = Math.min(SMILE_FRAMES_REQUIRED, smileFramesCount + 1);
+    } else if (smileFramesCount > 0) {
+        smileFramesCount = Math.max(0, smileFramesCount - 0.7);
+    }
+
+    const pct = Math.min(100, (smileFramesCount / SMILE_FRAMES_REQUIRED) * 100);
+    progressFill.style.width = `${pct}%`;
+
+    if (smileFramesCount >= SMILE_FRAMES_REQUIRED) {
+        showChallengeFeedback(true, "Perfect smile detected!");
+        setTimeout(() => {
+            overlayMessage.classList.remove('hidden');
+            document.getElementById('overlay-title').innerText = 'YOU ARE AWAKE!';
+            document.getElementById('overlay-desc').innerText = 'Great job — you completed the wake-up challenge.';
+            dismissChallenge();
+        }, 700);
     }
 }
 

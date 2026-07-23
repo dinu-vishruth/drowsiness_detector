@@ -13,7 +13,7 @@
                 <label for="username">Username</label>
                 <div class="input-wrapper">
                     <span class="input-icon">👤</span>
-                    <input type="text" id="username" name="username" placeholder="Choose a username" required minlength="3" maxlength="150">
+                    <input type="text" id="username" name="username" required minlength="3" maxlength="150">
                 </div>
             </div>
             
@@ -21,7 +21,7 @@
                 <label for="email">Email Address</label>
                 <div class="input-wrapper">
                     <span class="input-icon">✉️</span>
-                    <input type="email" id="email" name="email" placeholder="Enter your email" required>
+                    <input type="email" id="email" name="email" required>
                 </div>
             </div>
             
@@ -29,7 +29,7 @@
                 <label for="password">Password</label>
                 <div class="input-wrapper">
                     <span class="input-icon">🔒</span>
-                    <input type="password" id="password" name="password" placeholder="Create a password" required minlength="8" pattern="(?=.*\d)(?=.*[a-z])(?=.*[A-Z]).{8,}" title="Must contain at least one number, one uppercase and lowercase letter, and at least 8 characters">
+                    <input type="password" id="password" name="password" required minlength="8" pattern="(?=.*\d)(?=.*[a-z])(?=.*[A-Z]).{8,}" title="Must contain at least one number, one uppercase and lowercase letter, and at least 8 characters">
                     <button type="button" class="toggle-password" onclick="togglePassword('password', this)">👁️</button>
                 </div>
                 <small class="password-hint">Must be 8+ characters with uppercase, lowercase, and number</small>
@@ -39,7 +39,7 @@
                 <label for="confirm_password">Confirm Password</label>
                 <div class="input-wrapper">
                     <span class="input-icon">🔒</span>
-                    <input type="password" id="confirm_password" name="confirm_password" placeholder="Confirm your password" required minlength="8">
+                    <input type="password" id="confirm_password" name="confirm_password" required minlength="8">
                     <button type="button" class="toggle-password" onclick="togglePassword('confirm_password', this)">👁️</button>
                 </div>
             </div>
