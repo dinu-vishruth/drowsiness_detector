@@ -30,6 +30,17 @@
             <div class="video-wrapper">
                 <video id="input-video" class="input-video" playsinline></video>
                 <canvas id="output-canvas" class="output-canvas"></canvas>
+
+                <div id="startup-overlay" class="startup-overlay hidden">
+                    <div class="startup-card">
+                        <div class="startup-spinner"></div>
+                        <h2 id="startup-title">Preparing monitoring</h2>
+                        <p id="startup-desc">Loading detection models…</p>
+                        <div class="startup-progress-row">
+                            <span id="startup-stage">Initializing</span>
+                        </div>
+                    </div>
+                </div>
                 
                 <!-- Danger Warning Overlay -->
                 <div id="overlay-message" class="overlay-message hidden">

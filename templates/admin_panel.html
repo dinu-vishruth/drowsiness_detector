@@ -1,0 +1,67 @@
+{% extends 'base.html' %}
+
+{% block title %}Admin Panel - Drowsiness Prevention System{% endblock %}
+
+{% block content %}
+<div class="glass-card admin-panel-card">
+    <div class="card-header">
+        <h2>🛡️ Admin Panel</h2>
+        <p>Monitor active sessions and inspect user dashboards securely.</p>
+    </div>
+
+    <div class="stats-overview-grid admin-stats">
+        <div class="glass-card stat-card glow-cyan">
+            <span class="stat-icon">👥</span>
+            <div class="stat-data">
+                <span class="stat-number">{{ active_count }}</span>
+                <span class="stat-label">Active Users</span>
+            </div>
+        </div>
+        <div class="glass-card stat-card glow-purple">
+            <span class="stat-icon">📋</span>
+            <div class="stat-data">
+                <span class="stat-number">{{ all_users|length }}</span>
+                <span class="stat-label">Registered Users</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="admin-grid">
+        <div class="glass-card">
+            <div class="card-header">
+                <h3>🟢 Currently Active Users</h3>
+            </div>
+            {% if active_users %}
+                <ul class="admin-list">
+                    {% for user in active_users %}
+                        <li>
+                            <span>{{ user.username }}</span>
+                            <a href="{{ url_for('admin_view_user_dashboard', user_id=user.id) }}" class="btn-table primary">View Dashboard</a>
+                        </li>
+                    {% endfor %}
+                </ul>
+            {% else %}
+                <p class="empty-state">No active users right now.</p>
+            {% endif %}
+        </div>
+
+        <div class="glass-card">
+            <div class="card-header">
+                <h3>👤 All Registered Users</h3>
+            </div>
+            {% if all_users %}
+                <ul class="admin-list">
+                    {% for user in all_users %}
+                        <li>
+                            <span>{{ user.username }}{% if user.is_admin %} (Admin){% endif %}</span>
+                            <a href="{{ url_for('admin_view_user_dashboard', user_id=user.id) }}" class="btn-table secondary">Inspect</a>
+                        </li>
+                    {% endfor %}
+                </ul>
+            {% else %}
+                <p class="empty-state">No users found.</p>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

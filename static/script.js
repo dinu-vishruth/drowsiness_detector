@@ -27,6 +27,10 @@ const logAlertsDisplay = document.getElementById('log-alerts');
 const challengeModal = document.getElementById('challenge-modal');
 const challengeArea = document.getElementById('challenge-area');
 const challengeFeedback = document.getElementById('challenge-feedback');
+const startupOverlay = document.getElementById('startup-overlay');
+const startupTitle = document.getElementById('startup-title');
+const startupDesc = document.getElementById('startup-desc');
+const startupStage = document.getElementById('startup-stage');
 
 // Application States
 let isMonitoring = false;
@@ -71,6 +75,115 @@ let lastNodFrame = 0;
 // Landmarker structures
 let latestHandLandmarks = null;
 let latestFaceLandmarks = null;
+
+let startupTiming = {
+    pageLoad: performance.now(),
+    cameraPermission: null,
+    cameraInitialization: null,
+    modelLoading: null,
+    faceDetectorInitialization: null,
+    firstFrameProcessed: null
+};
+let startupPromise = null;
+let monitoringRuntimeReady = false;
+
+function logStartupStage(stage, detail) {
+    const elapsed = performance.now() - startupTiming.pageLoad;
+    const label = `[startup] ${stage} after ${Math.round(elapsed)}ms`;
+    if (detail) console.info(label, detail);
+    else console.info(label);
+}
+
+function setStartupOverlay(visible, title = 'Preparing monitoring', description = 'Loading detection models…', stage = 'Initializing') {
+    if (!startupOverlay) return;
+    if (visible) {
+        startupOverlay.classList.remove('hidden');
+        if (startupTitle) startupTitle.innerText = title;
+        if (startupDesc) startupDesc.innerText = description;
+        if (startupStage) startupStage.innerText = stage;
+    } else {
+        startupOverlay.classList.add('hidden');
+    }
+}
+
+function createWarmupCanvas() {
+    const canvas = document.createElement('canvas');
+    canvas.width = 640;
+    canvas.height = 480;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#050508';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 44px sans-serif';
+    ctx.fillText('Loading...', 180, 250);
+    return canvas;
+}
+
+async function initializeMonitoringRuntime() {
+    if (startupPromise) return startupPromise;
+
+    startupPromise = (async () => {
+        logStartupStage('page load', 'Monitoring page initialized');
+        setStartupOverlay(true, 'Preparing monitoring', 'Loading detection models…', 'Initializing');
+
+        try {
+            if (!hands) {
+                logStartupStage('model loading', 'Creating MediaPipe hands model');
+                hands = new Hands({
+                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+                });
+                hands.setOptions({
+                    maxNumHands: 2,
+                    modelComplexity: 0,
+                    minDetectionConfidence: 0.6,
+                    minTrackingConfidence: 0.6
+                });
+                hands.onResults(onHandResults);
+            }
+
+            if (!faceMesh) {
+                logStartupStage('face detector initialization', 'Creating MediaPipe face mesh model');
+                faceMesh = new FaceMesh({
+                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+                });
+                faceMesh.setOptions({
+                    maxNumFaces: 1,
+                    refineLandmarks: true,
+                    minDetectionConfidence: 0.6,
+                    minTrackingConfidence: 0.6
+                });
+                faceMesh.onResults(onFaceResults);
+            }
+
+            if (!camera) {
+                camera = new Camera(videoElement, {
+                    onFrame: async () => {
+                        await hands.send({ image: videoElement });
+                        await faceMesh.send({ image: videoElement });
+                    },
+                    width: 640,
+                    height: 480
+                });
+            }
+
+            const warmupCanvas = createWarmupCanvas();
+            logStartupStage('model loading', 'Warming MediaPipe models with a preload frame');
+            await hands.send({ image: warmupCanvas });
+            await faceMesh.send({ image: warmupCanvas });
+            startupTiming.firstFrameProcessed = performance.now() - startupTiming.pageLoad;
+            logStartupStage('first frame processed', 'Warm-up frame completed');
+
+            monitoringRuntimeReady = true;
+            setStartupOverlay(false);
+        } catch (err) {
+            console.error('[startup] Failed to prepare monitoring runtime', err);
+            setStartupOverlay(true, 'Startup issue', 'Could not load monitoring runtime. Please refresh.', 'Failed');
+            throw err;
+        }
+    })();
+
+    return startupPromise;
+}
 
 // Audio Context init for audible alarms
 function initAudio() {
@@ -822,44 +935,14 @@ function stopTimer() {
     }
 }
 
-// MediaPipe API instances
-hands = new Hands({
-    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
-});
-hands.setOptions({
-    maxNumHands: 2,
-    modelComplexity: 0, // Lite for rapid frames
-    minDetectionConfidence: 0.6,
-    minTrackingConfidence: 0.6
-});
-hands.onResults(onHandResults);
-
-faceMesh = new FaceMesh({
-    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
-});
-faceMesh.setOptions({
-    maxNumFaces: 1,
-    refineLandmarks: true,
-    minDetectionConfidence: 0.6,
-    minTrackingConfidence: 0.6
-});
-faceMesh.onResults(onFaceResults);
-
-camera = new Camera(videoElement, {
-    onFrame: async () => {
-        // Send frames to MediaPipe model
-        await hands.send({ image: videoElement });
-        await faceMesh.send({ image: videoElement });
-    },
-    width: 640,
-    height: 480
-});
-
 // Control triggers
 
 // Start session
 startBtn.addEventListener('click', async () => {
     try {
+        setStartupOverlay(true, 'Starting monitoring', 'Requesting camera access…', 'Camera permission');
+        logStartupStage('camera permission', 'Waiting for camera access');
+
         // Request backend starts logging active session
         const resp = await fetch('/api/session/start', { method: 'POST' });
         const data = await resp.json();
@@ -889,8 +972,15 @@ startBtn.addEventListener('click', async () => {
         logFocusDisplay.innerText = "100%";
         
         initAudio();
-        
+
+        await initializeMonitoringRuntime();
+        startupTiming.cameraPermission = performance.now() - startupTiming.pageLoad;
+        logStartupStage('camera initialization', 'Starting camera stream');
+        setStartupOverlay(true, 'Starting monitoring', 'Opening camera feed…', 'Camera initialization');
         await camera.start();
+        startupTiming.cameraInitialization = performance.now() - startupTiming.pageLoad;
+        logStartupStage('camera initialization', 'Camera stream started');
+        setStartupOverlay(false);
         
         statusText.innerText = "Monitoring";
         statusLight.className = "light green";
@@ -904,8 +994,11 @@ startBtn.addEventListener('click', async () => {
         statusLight.className = "light red";
         startBtn.disabled = false;
         stopBtn.disabled = true;
+        setStartupOverlay(true, 'Startup issue', 'Could not start monitoring. Please allow camera access and refresh.', 'Failed');
     }
 });
+
+initializeMonitoringRuntime().catch(() => {});
 
 // Stop session
 stopBtn.addEventListener('click', async () => {

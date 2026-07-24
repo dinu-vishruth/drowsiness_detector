@@ -24,6 +24,9 @@
                 {% if current_user.is_authenticated %}
                     <a href="{{ url_for('dashboard') }}" class="nav-link {% if active_page == 'dashboard' %}active{% endif %}">Dashboard</a>
                     <a href="{{ url_for('monitor') }}" class="nav-link {% if active_page == 'monitor' %}active{% endif %}">Start Monitoring</a>
+                    {% if current_user.is_admin %}
+                        <a href="{{ url_for('admin_panel') }}" class="nav-link {% if active_page == 'admin' %}active{% endif %}">Admin Panel</a>
+                    {% endif %}
                     
                     <div class="user-badge">
                         <span class="streak-fire">🔥 {{ current_user.streak_days }}d</span>

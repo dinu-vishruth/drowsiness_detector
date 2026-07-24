@@ -8,28 +8,38 @@
 {% endblock %}
 
 {% block content %}
+{% if admin_view %}
+<div class="glass-card admin-banner">
+    <div>
+        <h3>🛡️ Admin Preview</h3>
+        <p>You are viewing {{ display_user.username }}'s dashboard.</p>
+    </div>
+    <a href="{{ url_for('admin_panel') }}" class="btn secondary">Back to Admin Panel</a>
+</div>
+{% endif %}
+
 <div class="dashboard-grid">
     <!-- Row 1: Profile Summary Card -->
     <div class="glass-card profile-card">
         <div class="profile-header">
             <div class="profile-avatar">⚡</div>
             <div class="profile-info">
-                <h3>{{ current_user.username }}</h3>
+                <h3>{{ display_user.username }}</h3>
                 <p class="user-level">Level {{ level }} Alertness Specialist</p>
                 <div class="level-progress-container">
                     <div class="level-progress-bar" style="width: {{ level_progress }}%;"></div>
                 </div>
-                <span class="level-progress-text">{{ current_user.points % 500 }} / 500 XP to Level {{ level + 1 }}</span>
+                <span class="level-progress-text">{{ display_user.points % 500 }} / 500 XP to Level {{ level + 1 }}</span>
             </div>
         </div>
         
         <div class="profile-stats-grid">
             <div class="p-stat">
-                <span class="p-stat-val">🔥 {{ current_user.streak_days }}</span>
+                <span class="p-stat-val">🔥 {{ display_user.streak_days }}</span>
                 <span class="p-stat-lbl">Active Streak</span>
             </div>
             <div class="p-stat">
-                <span class="p-stat-val">🪙 {{ current_user.points }}</span>
+                <span class="p-stat-val">🪙 {{ display_user.points }}</span>
                 <span class="p-stat-lbl">Total XP</span>
             </div>
             <div class="p-stat">

@@ -1,6 +1,7 @@
 import os
 import csv
 import io
+from functools import wraps
 from datetime import datetime, date, timedelta
 from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, make_response
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
@@ -21,11 +22,14 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'drowsiness-detector-sec
 
 # Database configuration: Use PostgreSQL on Render, SQLite locally with absolute path
 database_url = os.environ.get('DATABASE_URL')
-if database_url and database_url.startswith('postgres'):
-    # Render PostgreSQL - fix for postgres:// vs postgresql://
-    if database_url.startswith('postgres://'):
-        database_url = database_url.replace('postgres://', 'postgresql://', 1)
-    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+if database_url:
+    if database_url.startswith('postgres'):
+        # Render PostgreSQL - fix for postgres:// vs postgresql://
+        if database_url.startswith('postgres://'):
+            database_url = database_url.replace('postgres://', 'postgresql://', 1)
+        app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+    else:
+        app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 else:
     # Local development - use absolute path in instance folder
     instance_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance')
@@ -45,17 +49,71 @@ app.config['MAIL_DEFAULT_SENDER'] = os.environ.get('MAIL_DEFAULT_SENDER', 'norep
 
 mail = Mail(app)
 
-# Initialize DB
-init_db(app)
-
 # Initialize Login Manager
 login_manager = LoginManager()
 login_manager.login_view = 'login'
 login_manager.init_app(app)
 
+ACTIVE_USER_IDS = set()
+
+
 @login_manager.user_loader
 def load_user(user_id):
     return User.query.get(int(user_id))
+
+
+def ensure_admin_account():
+    with app.app_context():
+        admin_username = os.environ.get('ADMIN_USERNAME', '').strip()
+        admin_password = os.environ.get('ADMIN_PASSWORD', '').strip()
+        admin_email = os.environ.get('ADMIN_EMAIL', '').strip() or f'{admin_username}@local.test'
+
+        if not admin_username or not admin_password:
+            return
+
+        admin_user = User.query.filter_by(username=admin_username).first()
+        if admin_user is None:
+            admin_user = User.query.filter_by(email=admin_email).first()
+
+        if admin_user is None:
+            admin_user = User(username=admin_username, email=admin_email, is_admin=True)
+            db.session.add(admin_user)
+
+        if admin_user.username != admin_username:
+            existing_username = User.query.filter_by(username=admin_username).first()
+            if existing_username is None or existing_username.id == admin_user.id:
+                admin_user.username = admin_username
+
+        if admin_user.email != admin_email:
+            existing_email = User.query.filter_by(email=admin_email).first()
+            if existing_email is None or existing_email.id == admin_user.id:
+                admin_user.email = admin_email
+
+        admin_user.is_admin = True
+        admin_user.set_password(admin_password)
+        db.session.commit()
+
+
+def admin_required(view_func):
+    @wraps(view_func)
+    @login_required
+    def wrapper(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin:
+            flash('Admin access required.', 'error')
+            return redirect(url_for('dashboard'))
+        return view_func(*args, **kwargs)
+    return wrapper
+
+
+@app.before_request
+def track_active_user():
+    if current_user.is_authenticated:
+        ACTIVE_USER_IDS.add(current_user.id)
+
+
+# Initialize DB
+init_db(app)
+ensure_admin_account()
 
 # --- AUTHENTICATION ROUTES ---
 
@@ -107,7 +165,10 @@ def login():
         
         if user and user.check_password(password):
             login_user(user)
+            ACTIVE_USER_IDS.add(user.id)
             flash(f'Welcome back, {user.username}!', 'success')
+            if user.is_admin:
+                return redirect(url_for('admin_panel'))
             return redirect(url_for('dashboard'))
         else:
             flash('Invalid username or password.', 'error')
@@ -118,6 +179,8 @@ def login():
 @app.route('/logout')
 @login_required
 def logout():
+    if current_user.is_authenticated:
+        ACTIVE_USER_IDS.discard(current_user.id)
     logout_user()
     flash('You have been logged out.', 'success')
     return redirect(url_for('login'))
@@ -220,20 +283,14 @@ def index():
 
 # --- DASHBOARD & MONITOR ROUTES ---
 
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    user = current_user
-    
-    # Calculate level statistics
+
+def build_dashboard_context(user):
     level = (user.points // 500) + 1
     level_progress = int(((user.points % 500) / 500.0) * 100)
-    
-    # Gather session counts
+
     total_sessions = len(user.sessions)
     total_duration_seconds = sum(s.duration_seconds for s in user.sessions)
-    
-    # Format total duration
+
     hours, remainder = divmod(total_duration_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     if hours > 0:
@@ -242,18 +299,15 @@ def dashboard():
         total_duration_formatted = f"{minutes}m {seconds}s"
     else:
         total_duration_formatted = f"{seconds}s"
-        
+
     total_alerts = sum(s.alerts_count for s in user.sessions)
     avg_focus = sum(s.focus_score for s in user.sessions) / total_sessions if total_sessions > 0 else 100.0
-    
-    # Chart data (last 10 sessions chronologically)
+
     chart_sessions = Session.query.filter_by(user_id=user.id).order_by(Session.start_time.desc()).limit(10).all()
-    chart_sessions.reverse() # chronologically ascending for the chart
-    
-    # Recent sessions list
+    chart_sessions.reverse()
+
     recent_sessions = Session.query.filter_by(user_id=user.id).order_by(Session.start_time.desc()).limit(20).all()
-    
-    # Achievements state loader
+
     unlocked_keys = {ach.achievement_key: ach.unlocked_at for ach in user.achievements}
     achievement_states = {}
     for key, val in ACHIEVEMENT_DEFINITIONS.items():
@@ -266,25 +320,54 @@ def dashboard():
             'unlocked': unlocked,
             'unlocked_at': unlocked_keys[key] if unlocked else None
         }
-    
+
     achievements_unlocked_count = len(unlocked_keys)
-    
     insights = analyze_user_sessions(user.id)
+
+    return {
+        'display_user': user,
+        'level': level,
+        'level_progress': level_progress,
+        'total_sessions': total_sessions,
+        'total_duration_formatted': total_duration_formatted,
+        'total_alerts': total_alerts,
+        'avg_focus': avg_focus,
+        'chart_sessions': chart_sessions,
+        'sessions': recent_sessions,
+        'achievement_states': achievement_states,
+        'achievements_unlocked_count': achievements_unlocked_count,
+        'insights': insights,
+    }
+
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    context = build_dashboard_context(current_user)
+    return render_template('dashboard.html', active_page='dashboard', **context)
+
+
+@app.route('/admin')
+@admin_required
+def admin_panel():
+    active_users = User.query.filter(User.id.in_(ACTIVE_USER_IDS)).order_by(User.username.asc()).all()
+    all_users = User.query.order_by(User.username.asc()).all()
     return render_template(
-        'dashboard.html',
-        active_page='dashboard',
-        level=level,
-        level_progress=level_progress,
-        total_sessions=total_sessions,
-        total_duration_formatted=total_duration_formatted,
-        total_alerts=total_alerts,
-        avg_focus=avg_focus,
-        chart_sessions=chart_sessions,
-        sessions=recent_sessions,
-        achievement_states=achievement_states,
-        achievements_unlocked_count=achievements_unlocked_count,
-        insights=insights
+        'admin_panel.html',
+        active_page='admin',
+        active_users=active_users,
+        all_users=all_users,
+        active_count=len(active_users)
     )
+
+
+@app.route('/admin/user/<int:user_id>')
+@admin_required
+def admin_view_user_dashboard(user_id):
+    user = User.query.get_or_404(user_id)
+    context = build_dashboard_context(user)
+    return render_template('dashboard.html', active_page='dashboard', admin_view=True, **context)
+
 
 @app.route('/monitor')
 @login_required
@@ -297,7 +380,7 @@ def monitor():
 @login_required
 def session_detail(session_id):
     session = Session.query.get_or_404(session_id)
-    if session.user_id != current_user.id:
+    if session.user_id != current_user.id and not current_user.is_admin:
         flash('Unauthorized access to session details.', 'error')
         return redirect(url_for('dashboard'))
         
@@ -522,7 +605,7 @@ def api_end_session():
 @login_required
 def export_csv(session_id):
     sess = Session.query.get_or_404(session_id)
-    if sess.user_id != current_user.id:
+    if sess.user_id != current_user.id and not current_user.is_admin:
         flash('Unauthorized access.', 'error')
         return redirect(url_for('dashboard'))
         
@@ -538,7 +621,7 @@ def export_csv(session_id):
 @login_required
 def export_pdf(session_id):
     sess = Session.query.get_or_404(session_id)
-    if sess.user_id != current_user.id:
+    if sess.user_id != current_user.id and not current_user.is_admin:
         flash('Unauthorized access.', 'error')
         return redirect(url_for('dashboard'))
         

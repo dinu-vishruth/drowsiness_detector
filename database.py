@@ -3,6 +3,7 @@ import secrets
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import UserMixin
 from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import text
 from datetime import datetime, timedelta
 
 db = SQLAlchemy()
@@ -18,6 +19,7 @@ class User(db.Model, UserMixin):
     streak_days = db.Column(db.Integer, default=0)
     last_active_date = db.Column(db.Date, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    is_admin = db.Column(db.Boolean, default=False, nullable=False)
     
     # Password reset fields
     reset_token = db.Column(db.String(100), nullable=True)
@@ -143,3 +145,11 @@ def init_db(app):
     db.init_app(app)
     with app.app_context():
         db.create_all()
+        inspector = db.inspect(db.engine)
+        existing_columns = {col['name'] for col in inspector.get_columns('users')}
+        if 'is_admin' not in existing_columns:
+            if db.engine.dialect.name == 'sqlite':
+                db.session.execute(text('ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT 0'))
+            else:
+                db.session.execute(text('ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE'))
+            db.session.commit()
