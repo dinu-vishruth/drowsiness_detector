@@ -1012,6 +1012,31 @@ body {
     font-weight: 600;
 }
 
+/* Progressive startup checklist */
+#startup-stage {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: flex-start;
+    text-align: left;
+    margin-top: 4px;
+}
+
+.startup-step {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    transition: color 0.2s ease;
+}
+
+.startup-step.active {
+    color: #fff;
+}
+
+.startup-step.done {
+    color: var(--primary-color);
+}
+
 /* Drowsiness alert overlay */
 .overlay-message {
     position: absolute;

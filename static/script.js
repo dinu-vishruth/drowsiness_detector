@@ -105,7 +105,44 @@ let monitoringRuntimeReady = false;
 let liveFirstFrameReceivedLogged = false;
 let liveFirstInferenceLogged = false;
 let liveFirstRenderedFrameLogged = false;
+let liveFirstFaceDetectedLogged = false;
 
+// --- STARTUP PERFORMANCE INSTRUMENTATION ---
+// Every requested milestone records an absolute timestamp here. mark() prints
+// both the elapsed-since-page-load and the delta from the previous mark so the
+// full startup timeline is readable straight from the console.
+const startupMarks = {};
+let lastMarkTime = startupTiming.pageLoad;
+function mark(name, detail) {
+    if (startupMarks[name] != null) return; // first occurrence wins
+    const now = performance.now();
+    startupMarks[name] = now;
+    const sincePage = Math.round(now - startupTiming.pageLoad);
+    const sincePrev = Math.round(now - lastMarkTime);
+    lastMarkTime = now;
+    console.info(`[startup] ${name.padEnd(28)} +${sincePage}ms (Δ${sincePrev}ms)`, detail || '');
+}
+function measure(label, fromName, toName) {
+    const a = startupMarks[fromName];
+    const b = startupMarks[toName];
+    if (a != null && b != null) {
+        console.info(`[startup] ⏱ ${label}: ${Math.round(b - a)}ms`);
+    }
+}
+function printStartupSummary() {
+    console.groupCollapsed('[startup] ── startup timing summary ──');
+    measure('runtime init (create → warm)', 'runtime-init-started', 'runtime-init-finished');
+    measure('model download + warm-up', 'model-loading-started', 'model-loading-finished');
+    measure('camera permission → stream', 'camera-permission-requested', 'getusermedia-resolved');
+    measure('session API round-trip', 'api-start', 'api-complete');
+    measure('click → first video frame', 'button-clicked', 'first-video-frame');
+    measure('click → first rendered frame', 'button-clicked', 'first-rendered-frame');
+    measure('click → first face detection', 'button-clicked', 'first-face-detection');
+    measure('click → READY (overlay hidden)', 'button-clicked', 'ready');
+    console.groupEnd();
+}
+
+// Backwards-compatible thin wrapper kept for any external callers.
 function logStartupStage(stage, detail) {
     const elapsed = performance.now() - startupTiming.pageLoad;
     const label = `[startup] ${stage} after ${Math.round(elapsed)}ms`;
@@ -113,16 +150,43 @@ function logStartupStage(stage, detail) {
     else console.info(label);
 }
 
-function setStartupOverlay(visible, title = 'Preparing monitoring', description = 'Loading detection models…', stage = 'Initializing') {
+function setStartupOverlay(visible, title = 'Preparing monitoring', description = 'Loading detection models…') {
     if (!startupOverlay) return;
     if (visible) {
         startupOverlay.classList.remove('hidden');
         if (startupTitle) startupTitle.innerText = title;
         if (startupDesc) startupDesc.innerText = description;
-        if (startupStage) startupStage.innerText = stage;
     } else {
         startupOverlay.classList.add('hidden');
     }
+}
+
+// --- PROGRESSIVE STARTUP CHECKLIST ---
+// Instead of a static "please wait" freeze, show each stage ticking off so the
+// user always sees forward progress while models download + the camera opens.
+const STARTUP_STEPS = [
+    { key: 'runtime', label: 'Loading runtime' },
+    { key: 'camera', label: 'Connecting camera' },
+    { key: 'detector', label: 'Initializing detector' },
+    { key: 'ready', label: 'Ready' }
+];
+let startupStepState = {};
+function renderStartupChecklist() {
+    if (!startupStage) return;
+    startupStage.innerHTML = STARTUP_STEPS.map((s) => {
+        const st = startupStepState[s.key] || 'pending';
+        const icon = st === 'done' ? '✓' : (st === 'active' ? '…' : '○');
+        return `<div class="startup-step ${st}">${icon} ${s.label}${st === 'active' ? '…' : ''}</div>`;
+    }).join('');
+}
+function setStartupStep(key, state) {
+    startupStepState[key] = state;
+    renderStartupChecklist();
+}
+function resetStartupChecklist() {
+    startupStepState = {};
+    STARTUP_STEPS.forEach((s) => { startupStepState[s.key] = 'pending'; });
+    renderStartupChecklist();
 }
 
 function createWarmupCanvas() {
@@ -138,80 +202,126 @@ function createWarmupCanvas() {
     return canvas;
 }
 
-async function initializeMonitoringRuntime() {
+// Paint the raw (un-analyzed) camera frame straight to the visible canvas.
+// Used while the models are still warming so the live feed appears the instant
+// getUserMedia resolves, instead of staying black until inference is ready.
+function drawRawVideoFrame() {
+    if (!videoElement.videoWidth) return;
+    if (!canvasElement.width || !canvasElement.height) resizeCanvas();
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.restore();
+}
+
+// Synchronous, cheap: construct the MediaPipe solution + Camera objects once and
+// reuse them across every monitoring session. Creating these does NOT download
+// the WASM/model blobs — that happens on the first send() (the warm-up frame).
+function createRuntimeObjects() {
+    if (!hands) {
+        mark('model-loading-started', 'Creating MediaPipe hands + face models');
+        hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
+        });
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 0,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+        hands.onResults(onHandResults);
+    }
+
+    if (!faceMesh) {
+        faceMesh = new FaceMesh({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${file}`
+        });
+        faceMesh.setOptions({
+            maxNumFaces: 1,
+            // Iris refinement loads a second model and adds per-frame cost.
+            // None of the EAR / MAR / pose / rub metrics use iris points, so keep it off.
+            refineLandmarks: false,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+        faceMesh.onResults(onFaceResults);
+    }
+
+    if (!camera) {
+        camera = new Camera(videoElement, {
+            onFrame: async () => {
+                if (!liveFirstFrameReceivedLogged) {
+                    liveFirstFrameReceivedLogged = true;
+                    startupTiming.firstFrameReceived = performance.now() - startupTiming.pageLoad;
+                    mark('first-video-frame', 'First live camera frame delivered to onFrame');
+                }
+                // While the detectors are still downloading/warming, just show the
+                // raw feed and skip inference. This avoids a same-instance send()
+                // colliding with the in-flight warm-up send, and gives an instant
+                // picture instead of a black square.
+                if (!monitoringRuntimeReady) {
+                    drawRawVideoFrame();
+                    return;
+                }
+                await Promise.all([
+                    hands.send({ image: videoElement }),
+                    faceMesh.send({ image: videoElement })
+                ]);
+                if (!liveFirstInferenceLogged) {
+                    liveFirstInferenceLogged = true;
+                    startupTiming.firstInference = performance.now() - startupTiming.pageLoad;
+                    mark('first-inference', 'First live-frame inference completed (hands + face)');
+                }
+            },
+            width: 640,
+            height: 480
+        });
+    }
+}
+
+// Warm both models concurrently. Each solution owns an independent WASM
+// instance, so the two (multi-MB) CDN downloads + inits overlap instead of
+// running back-to-back — historically the dominant "Preparing monitoring" cost.
+async function warmupRuntime() {
+    const warmupCanvas = createWarmupCanvas();
+    // Warm the two solutions SEQUENTIALLY, never concurrently. MediaPipe's
+    // FaceMesh and Hands are Emscripten builds that share a global `Module`
+    // object; the Hands packed-assets loader resolves its .data/.wasm via
+    // `Module.locateFile` and, if that global is clobbered by a concurrently
+    // initializing FaceMesh, falls back to a bare relative filename — which
+    // 404s (http://<origin>/hands_solution_packed_assets.data). Initializing
+    // one fully before the other keeps each solution's locateFile intact.
+    await hands.send({ image: warmupCanvas });
+    await faceMesh.send({ image: warmupCanvas });
+    startupTiming.firstFrameProcessed = performance.now() - startupTiming.pageLoad;
+    startupTiming.modelLoading = performance.now() - startupTiming.pageLoad;
+    startupTiming.faceDetectorInitialization = startupTiming.modelLoading;
+    monitoringRuntimeReady = true;
+    mark('model-loading-finished', 'Warm-up frame completed — detectors ready');
+    mark('face-detector-initialized', 'Face detector warmed and ready');
+}
+
+// Idempotent: creates the runtime objects (sync) and kicks off the one-time
+// warm-up (async). Returns the shared warm-up promise so repeated calls — page
+// load preload and the Start click — never recreate models or re-download WASM.
+function initializeMonitoringRuntime() {
     if (startupPromise) return startupPromise;
 
-    startupPromise = (async () => {
-        logStartupStage('page load', 'Monitoring page initialized');
-        setStartupOverlay(true, 'Preparing monitoring', 'Loading detection models…', 'Initializing');
+    mark('runtime-init-started', 'initializeMonitoringRuntime invoked');
+    createRuntimeObjects();
 
-        try {
-            if (!hands) {
-                logStartupStage('model loading', 'Creating MediaPipe hands model');
-                hands = new Hands({
-                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
-                });
-                hands.setOptions({
-                    maxNumHands: 2,
-                    modelComplexity: 0,
-                    minDetectionConfidence: 0.6,
-                    minTrackingConfidence: 0.6
-                });
-                hands.onResults(onHandResults);
-            }
-
-            if (!faceMesh) {
-                logStartupStage('face detector initialization', 'Creating MediaPipe face mesh model');
-                faceMesh = new FaceMesh({
-                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${file}`
-                });
-                faceMesh.setOptions({
-                    maxNumFaces: 1,
-                    // Iris refinement loads a second model and adds per-frame cost.
-                    // None of the EAR / MAR / pose / rub metrics use iris points, so keep it off.
-                    refineLandmarks: false,
-                    minDetectionConfidence: 0.6,
-                    minTrackingConfidence: 0.6
-                });
-                faceMesh.onResults(onFaceResults);
-            }
-
-            if (!camera) {
-                camera = new Camera(videoElement, {
-                    onFrame: async () => {
-                        if (!liveFirstFrameReceivedLogged) {
-                            liveFirstFrameReceivedLogged = true;
-                            startupTiming.firstFrameReceived = performance.now() - startupTiming.pageLoad;
-                            logStartupStage('first frame received', 'First live camera frame delivered to onFrame');
-                        }
-                        await hands.send({ image: videoElement });
-                        await faceMesh.send({ image: videoElement });
-                        if (!liveFirstInferenceLogged) {
-                            liveFirstInferenceLogged = true;
-                            startupTiming.firstInference = performance.now() - startupTiming.pageLoad;
-                            logStartupStage('first inference', 'First live-frame inference completed (hands + face mesh)');
-                        }
-                    },
-                    width: 640,
-                    height: 480
-                });
-            }
-
-            const warmupCanvas = createWarmupCanvas();
-            logStartupStage('model loading', 'Warming MediaPipe models with a preload frame');
-            await hands.send({ image: warmupCanvas });
-            await faceMesh.send({ image: warmupCanvas });
-            startupTiming.firstFrameProcessed = performance.now() - startupTiming.pageLoad;
-            logStartupStage('first frame processed', 'Warm-up frame completed');
-
-            monitoringRuntimeReady = true;
-            setStartupOverlay(false);
-        } catch (err) {
+    startupPromise = warmupRuntime()
+        .then(() => {
+            mark('runtime-init-finished', 'Runtime fully initialized');
+        })
+        .catch((err) => {
             console.error('[startup] Failed to prepare monitoring runtime', err);
-            setStartupOverlay(true, 'Startup issue', 'Could not load monitoring runtime. Please refresh.', 'Failed');
+            // Allow a later Start click (or refresh) to retry a failed warm-up
+            // instead of being stuck on the rejected promise forever.
+            startupPromise = null;
+            monitoringRuntimeReady = false;
             throw err;
-        }
-    })();
+        });
 
     return startupPromise;
 }
@@ -625,13 +735,17 @@ function onFaceResults(results) {
     if (!liveFirstRenderedFrameLogged) {
         liveFirstRenderedFrameLogged = true;
         startupTiming.firstRenderedFrame = performance.now() - startupTiming.pageLoad;
-        logStartupStage('first rendered frame', 'First live frame drawn to output canvas');
+        mark('first-rendered-frame', 'First analyzed frame drawn to output canvas');
     }
 
     let avgEAR = 0;
-    
+
     // Face details
     if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        if (!liveFirstFaceDetectedLogged) {
+            liveFirstFaceDetectedLogged = true;
+            mark('first-face-detection', 'First successful face landmark detection');
+        }
         latestFaceLandmarks = results.multiFaceLandmarks[0];
         const landmarks = latestFaceLandmarks;
         
@@ -998,24 +1112,31 @@ function stopTimer() {
 // Start session
 startBtn.addEventListener('click', async () => {
     try {
-        setStartupOverlay(true, 'Starting monitoring', 'Requesting camera access…', 'Camera permission');
-        logStartupStage('camera permission', 'Waiting for camera access');
+        mark('button-clicked', 'Start Monitoring clicked');
+        resetStartupChecklist();
+        setStartupOverlay(true, 'Starting monitoring', 'Loading runtime and opening camera…');
 
-        // Request backend starts logging active session
-        const resp = await fetch('/api/session/start', { method: 'POST' });
-        const data = await resp.json();
-        if (data.session_id) {
-            activeSessionId = data.session_id;
-        }
-        
+        // Kick off the session-start request WITHOUT awaiting it yet, so its
+        // network round-trip overlaps with model init + camera startup below
+        // instead of adding to the perceived startup time. We await it later.
+        mark('api-start', 'POST /api/session/start dispatched');
+        const sessionStartPromise = fetch('/api/session/start', { method: 'POST' })
+            .then((resp) => resp.json())
+            .then((data) => { mark('api-complete', 'session start response received'); return data; })
+            .catch((err) => {
+                console.error('Failed to start server session:', err);
+                mark('api-complete', 'session start failed');
+                return {};
+            });
+
         isMonitoring = true;
         startBtn.disabled = true;
         stopBtn.disabled = false;
         calibrateBtn.disabled = false;
-        
+
         statusText.innerText = "Camera waking...";
         statusLight.className = "light yellow";
-        
+
         // Reset local statistics
         yawnsCount = 0;
         blinksCount = 0;
@@ -1029,42 +1150,77 @@ startBtn.addEventListener('click', async () => {
         liveFirstFrameReceivedLogged = false;
         liveFirstInferenceLogged = false;
         liveFirstRenderedFrameLogged = false;
+        liveFirstFaceDetectedLogged = false;
 
         // Reset nod-velocity tracking state
         lastPitchRatio = null;
         lastDrowsyNodFrame = -1000;
-        
+
         logYawnsDisplay.innerText = 0;
         logAlertsDisplay.innerText = 0;
         logFocusDisplay.innerText = "100%";
-        
+
         initAudio();
 
-        await initializeMonitoringRuntime();
-        startupTiming.cameraPermission = performance.now() - startupTiming.pageLoad;
-        logStartupStage('camera initialization', 'Starting camera stream');
-        setStartupOverlay(true, 'Starting monitoring', 'Opening camera feed…', 'Camera initialization');
-        await camera.start();
-        startupTiming.cameraInitialization = performance.now() - startupTiming.pageLoad;
-        logStartupStage('camera initialization', 'Camera stream started');
+        // Kick off model warm-up (returns the shared promise; if the page-load
+        // preload already finished this resolves immediately).
+        setStartupStep('runtime', monitoringRuntimeReady ? 'done' : 'active');
+        setStartupStep('detector', 'pending');
+        const runtimeReady = initializeMonitoringRuntime()
+            .then(() => {
+                setStartupStep('runtime', 'done');
+                setStartupStep('detector', 'done');
+            });
+
+        // Start the camera CONCURRENTLY with the warm-up rather than after it.
+        // getUserMedia / permission no longer waits on multi-MB WASM downloads,
+        // so the live feed appears as soon as the stream is granted; inference
+        // switches on the moment warm-up finishes (guarded by monitoringRuntimeReady).
+        setStartupStep('camera', 'active');
+        mark('camera-permission-requested', 'camera.start() invoked');
+        const cameraReady = camera.start().then(() => {
+            startupTiming.cameraPermission = performance.now() - startupTiming.pageLoad;
+            startupTiming.cameraInitialization = performance.now() - startupTiming.pageLoad;
+            mark('camera-permission-granted', 'camera permission granted');
+            mark('getusermedia-resolved', 'camera stream started');
+            setStartupStep('camera', 'done');
+        });
+
+        // Wait for both independent tracks to complete.
+        await Promise.all([runtimeReady, cameraReady]);
+
+        // Resolve the session id kicked off earlier; by now the request has
+        // almost certainly completed in parallel with camera + model startup.
+        const sessionData = await sessionStartPromise;
+        if (sessionData.session_id) {
+            activeSessionId = sessionData.session_id;
+        }
+
+        setStartupStep('ready', 'done');
+        mark('ready', 'monitoring fully started');
+        printStartupSummary();
         setStartupOverlay(false);
-        
+
         statusText.innerText = "Monitoring";
         statusLight.className = "light green";
         document.getElementById('rec-dot').classList.add('pulse-dot');
-        
+
         startTimer();
-        
+
     } catch(err) {
         console.error('Failed to boot monitoring session:', err);
         statusText.innerText = "Access Failed";
         statusLight.className = "light red";
         startBtn.disabled = false;
         stopBtn.disabled = true;
-        setStartupOverlay(true, 'Startup issue', 'Could not start monitoring. Please allow camera access and refresh.', 'Failed');
+        isMonitoring = false;
+        setStartupOverlay(true, 'Startup issue', 'Could not start monitoring. Please allow camera access and refresh.');
     }
 });
 
+// Preload models on page load so the WASM/model download overlaps with the user
+// reading the page — by the time they click Start, warm-up is often already done.
+mark('dom-ready', 'script.js executing (DOM parsed)');
 initializeMonitoringRuntime().catch(() => {});
 
 // Stop session
