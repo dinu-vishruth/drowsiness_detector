@@ -49,13 +49,24 @@ sensitivityInput.value = DROWSINESS_THRESHOLD;
 sensitivityValue.textContent = DROWSINESS_THRESHOLD.toFixed(2);
 
 const YAWN_THRESHOLD = 0.55;
-const TILT_THRESHOLD = 0.35; // head roll angle
-const PITCH_THRESHOLD_DOWN = 1.35; // head looking down
+const TILT_THRESHOLD = 0.35; // head roll angle (warning only)
+const PITCH_THRESHOLD_DOWN = 1.35; // head looking down (warning only, never triggers alone)
+
+// --- WAKE-UP CHALLENGE TRIGGER MODEL ---
+// The critical challenge is a MICROSLEEP response. It requires sustained eye
+// closure as a necessary condition. Head nods, yawns, tilt, looking-down and
+// eye-rubbing are warnings only — none of them can fire the challenge on their own.
+const WARNING_CLOSED_FRAMES = 3;          // ~0.2s: gentle Level-1 warning after brief closure
+const EAR_CLOSED_FRAMES_TO_TRIGGER = 20;  // ~1.3s sustained closure alone -> critical challenge
+const EAR_CLOSED_FRAMES_WITH_NOD = 12;    // sustained closure corroborated by a drowsy nod -> fire sooner
+const NOD_PITCH_DROP_VELOCITY = 0.12;     // per-frame fall in pitch ratio = loss of muscle control
+const NOD_CORROBORATION_WINDOW = 25;      // frames a recent drowsy nod stays "fresh" to corroborate closure
 
 // Tracking counters & metrics
 let frameCounter = 0;
-let consecutiveDrowsyFrames = 0;
-const FRAMES_TO_TRIGGER = 20; // ~1.5 seconds of consecutive closure (reduced false positives)
+let consecutiveDrowsyFrames = 0;   // frames of SUSTAINED EYE CLOSURE (the trigger driver)
+let lastPitchRatio = null;         // previous-frame head pitch ratio, for nod velocity
+let lastDrowsyNodFrame = -1000;    // last frame a genuine (fast) downward nod was seen
 
 // Session cumulative variables
 let sessionStartTime = null;
@@ -82,10 +93,18 @@ let startupTiming = {
     cameraInitialization: null,
     modelLoading: null,
     faceDetectorInitialization: null,
-    firstFrameProcessed: null
+    firstFrameProcessed: null,
+    firstFrameReceived: null,
+    firstInference: null,
+    firstRenderedFrame: null
 };
 let startupPromise = null;
 let monitoringRuntimeReady = false;
+
+// One-shot flags so live-session timing markers only fire on the first real frame
+let liveFirstFrameReceivedLogged = false;
+let liveFirstInferenceLogged = false;
+let liveFirstRenderedFrameLogged = false;
 
 function logStartupStage(stage, detail) {
     const elapsed = performance.now() - startupTiming.pageLoad;
@@ -130,7 +149,7 @@ async function initializeMonitoringRuntime() {
             if (!hands) {
                 logStartupStage('model loading', 'Creating MediaPipe hands model');
                 hands = new Hands({
-                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`
                 });
                 hands.setOptions({
                     maxNumHands: 2,
@@ -144,11 +163,13 @@ async function initializeMonitoringRuntime() {
             if (!faceMesh) {
                 logStartupStage('face detector initialization', 'Creating MediaPipe face mesh model');
                 faceMesh = new FaceMesh({
-                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4.1633559619/${file}`
                 });
                 faceMesh.setOptions({
                     maxNumFaces: 1,
-                    refineLandmarks: true,
+                    // Iris refinement loads a second model and adds per-frame cost.
+                    // None of the EAR / MAR / pose / rub metrics use iris points, so keep it off.
+                    refineLandmarks: false,
                     minDetectionConfidence: 0.6,
                     minTrackingConfidence: 0.6
                 });
@@ -158,8 +179,18 @@ async function initializeMonitoringRuntime() {
             if (!camera) {
                 camera = new Camera(videoElement, {
                     onFrame: async () => {
+                        if (!liveFirstFrameReceivedLogged) {
+                            liveFirstFrameReceivedLogged = true;
+                            startupTiming.firstFrameReceived = performance.now() - startupTiming.pageLoad;
+                            logStartupStage('first frame received', 'First live camera frame delivered to onFrame');
+                        }
                         await hands.send({ image: videoElement });
                         await faceMesh.send({ image: videoElement });
+                        if (!liveFirstInferenceLogged) {
+                            liveFirstInferenceLogged = true;
+                            startupTiming.firstInference = performance.now() - startupTiming.pageLoad;
+                            logStartupStage('first inference', 'First live-frame inference completed (hands + face mesh)');
+                        }
                     },
                     width: 640,
                     height: 480
@@ -590,7 +621,13 @@ function onFaceResults(results) {
     canvasCtx.save();
     canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
     canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
-    
+
+    if (!liveFirstRenderedFrameLogged) {
+        liveFirstRenderedFrameLogged = true;
+        startupTiming.firstRenderedFrame = performance.now() - startupTiming.pageLoad;
+        logStartupStage('first rendered frame', 'First live frame drawn to output canvas');
+    }
+
     let avgEAR = 0;
     
     // Face details
@@ -653,92 +690,92 @@ function onFaceResults(results) {
         }
         
         // --- NORMAL MONITORING LOGICS ---
-        
-        let isDrowsyThisFrame = false;
-        let frameReason = "";
-        
-        // 1. BLINK COUNTING
-        if (avgEAR < DROWSINESS_THRESHOLD) {
-            if (!isBlinking) {
-                isBlinking = true;
-            }
-        } else {
-            if (isBlinking) {
-                blinksCount++;
-                isBlinking = false;
-            }
+        //
+        // Trigger model:
+        //   * Sustained EYE CLOSURE is the ONLY driver of the critical wake-up
+        //     challenge. consecutiveDrowsyFrames counts consecutive closed-eye
+        //     frames and nothing else.
+        //   * Yawns, head tilt, looking down, and eye-rubbing are WARNING-only
+        //     indicators. They surface a Level-1 warning but never accumulate
+        //     toward, or fire, the challenge on their own.
+        //   * A genuine drowsy NOD (a fast downward pitch drop = loss of muscle
+        //     control) does not fire anything by itself either; it only lowers
+        //     the closure frame count needed when the eyes are also closed.
+
+        // 1. Eye closure (the core microsleep signal)
+        const eyesClosed = avgEAR < DROWSINESS_THRESHOLD;
+
+        // BLINK COUNTING
+        if (eyesClosed) {
+            if (!isBlinking) isBlinking = true;
+        } else if (isBlinking) {
+            blinksCount++;
+            isBlinking = false;
         }
-        
-        // 2. Drowsiness condition: Closed eyes
-        if (avgEAR < DROWSINESS_THRESHOLD) {
-            isDrowsyThisFrame = true;
-            frameReason = "Eyes Closed";
-        }
-        
-        // 3. Yawn logic: Mouth Opening Ratio
+
+        // 2. Yawn logic: Mouth Opening Ratio (warning indicator)
         const pUpper = landmarks[13];
         const pLower = landmarks[14];
         const pLeft = landmarks[78];
         const pRight = landmarks[308];
         const distVert = getDistance(pUpper, pLower);
         const distHoriz = getDistance(pLeft, pRight);
-        
+
         let mar = 0;
-        if (distHoriz > 0) {
-            mar = distVert / distHoriz;
+        if (distHoriz > 0) mar = distVert / distHoriz;
+
+        const isYawning = mar > YAWN_THRESHOLD;
+        if (isYawning && frameCounter - lastYawnFrame > 60) {
+            yawnsCount++;
+            logYawnsDisplay.innerText = yawnsCount;
+            lastYawnFrame = frameCounter;
         }
-        
-        if (mar > YAWN_THRESHOLD) {
-            // Prevent spamming yawn count multiple times per second
-            if (frameCounter - lastYawnFrame > 60) {
-                yawnsCount++;
-                logYawnsDisplay.innerText = yawnsCount;
-                lastYawnFrame = frameCounter;
-            }
-            isDrowsyThisFrame = true;
-            frameReason = "Yawning";
-        }
-        
-        // 4. Head nodding/tilt pose logic
-        // Head Roll (sideways tilt)
+
+        // 3. Head pose (roll = tilt, pitch = up/down)
         const eyeDx = landmarks[263].x - landmarks[33].x;
         const eyeDy = landmarks[263].y - landmarks[33].y;
         const headRollAngle = Math.abs(Math.atan2(eyeDy, eyeDx));
-        
-        // Head Pitch (looking down)
+
         const nosePoint = landmarks[1];
         const chinPoint = landmarks[152];
         const midEyesPoint = landmarks[168];
         const noseToChin = getDistance(nosePoint, chinPoint);
         const midEyesToNose = getDistance(midEyesPoint, nosePoint);
-        
         const headPitchRatio = midEyesToNose > 0 ? noseToChin / midEyesToNose : 1.0;
-        
-        if (headRollAngle > TILT_THRESHOLD) {
-            isDrowsyThisFrame = true;
-            frameReason = "Head Tilted";
-        } else if (headPitchRatio < PITCH_THRESHOLD_DOWN) {
-            if (frameCounter - lastNodFrame > 60) {
-                nodsCount++;
-                lastNodFrame = frameCounter;
+
+        const isTilted = headRollAngle > TILT_THRESHOLD;
+        const isLookingDown = headPitchRatio < PITCH_THRESHOLD_DOWN;
+
+        // Genuine drowsy nod = the head DROPS quickly (loss of muscle control),
+        // not merely holding a looking-down pose. Measured as per-frame fall in
+        // the pitch ratio. A slow, deliberate look-down has near-zero velocity
+        // and is intentionally ignored here.
+        let drowsyNodThisFrame = false;
+        if (lastPitchRatio !== null) {
+            const pitchDrop = lastPitchRatio - headPitchRatio;
+            if (pitchDrop > NOD_PITCH_DROP_VELOCITY && isLookingDown) {
+                drowsyNodThisFrame = true;
+                lastDrowsyNodFrame = frameCounter;
+                if (frameCounter - lastNodFrame > 60) {
+                    nodsCount++;
+                    lastNodFrame = frameCounter;
+                }
             }
-            isDrowsyThisFrame = true;
-            frameReason = "Head Nodding";
         }
-        
-        // 5. Hand touching eyes/rubbing
+        lastPitchRatio = headPitchRatio;
+
+        // 4. Hand touching eyes/rubbing (warning indicator)
+        let isRubbing = false;
         if (latestHandLandmarks) {
             const eyeCoordinates = [landmarks[33], landmarks[133], landmarks[362], landmarks[263]];
             const fingertips = [4, 8, 12, 16, 20];
-            
+
             for (const hand of latestHandLandmarks) {
                 for (const tipIdx of fingertips) {
                     const fingerTip = hand[tipIdx];
                     for (const eyePoint of eyeCoordinates) {
                         if (getDistance(fingerTip, eyePoint) < 0.08) {
-                            isDrowsyThisFrame = true;
-                            frameReason = "Eye Rubbing";
-                            // Draw alert line on canvas
+                            isRubbing = true;
                             canvasCtx.strokeStyle = "#ff0055";
                             canvasCtx.lineWidth = 3;
                             canvasCtx.beginPath();
@@ -748,57 +785,78 @@ function onFaceResults(results) {
                             break;
                         }
                     }
-                    if (isDrowsyThisFrame && frameReason === "Eye Rubbing") break;
+                    if (isRubbing) break;
                 }
-                if (isDrowsyThisFrame && frameReason === "Eye Rubbing") break;
+                if (isRubbing) break;
             }
         }
-        
+
+        // A recent drowsy nod stays "fresh" for a short window so it can
+        // corroborate eye closure even if the two peak a few frames apart.
+        const nodFresh = (frameCounter - lastDrowsyNodFrame) < NOD_CORROBORATION_WINDOW;
+
         // --- ALERT OR MONITOR DECISIONS ---
-        if (isDrowsyThisFrame) {
+        // Only sustained eye closure advances the critical counter.
+        if (eyesClosed) {
             consecutiveDrowsyFrames++;
-            
-            // Progressive Alerting Level 1: Warning (Voice synthesis warning at frame 3)
-            if (consecutiveDrowsyFrames === 3) {
-                statusText.innerText = `Warning: ${frameReason}`;
+
+            // With a corroborating drowsy nod, a shorter closure fires the challenge.
+            const triggerFrames = nodFresh ? EAR_CLOSED_FRAMES_WITH_NOD : EAR_CLOSED_FRAMES_TO_TRIGGER;
+
+            // Level 1: gentle warning after brief sustained closure
+            if (consecutiveDrowsyFrames === WARNING_CLOSED_FRAMES) {
+                statusText.innerText = "Warning: Eyes Closing";
                 statusLight.className = "light yellow";
-                speakVoiceWarning(frameReason);
-                logAlertEventToServer("Warning", frameReason);
+                speakVoiceWarning("Eyes Closed");
+                logAlertEventToServer("Warning", "Eyes Closing");
             }
-            
-            // Progressive Alerting Level 2: Critical (Trigger modal and sirens)
-            if (consecutiveDrowsyFrames >= FRAMES_TO_TRIGGER) {
+
+            // Level 2: critical challenge on sustained closure (optionally + nod)
+            if (consecutiveDrowsyFrames === triggerFrames) {
+                const reason = nodFresh ? "Eyes Closed + Head Nod" : "Prolonged Eye Closure";
                 alertsCount++;
                 logAlertsDisplay.innerText = alertsCount;
-                
-                // Deduct focus points
+
                 focusScore = Math.max(10, focusScore - 8);
                 logFocusDisplay.innerText = `${Math.round(focusScore)}%`;
-                
-                statusText.innerText = `CRITICAL ALERT!`;
+
+                statusText.innerText = "CRITICAL ALERT!";
                 statusLight.className = "light red";
                 overlayMessage.classList.remove('hidden');
-                
                 document.getElementById('overlay-title').innerText = "WAKE UP!";
-                document.getElementById('overlay-desc').innerText = `${frameReason} detected`;
-                
-                logAlertEventToServer("Critical", frameReason);
-                
-                // Fire challenge modal
+                document.getElementById('overlay-desc').innerText = `${reason} detected`;
+
+                logAlertEventToServer("Critical", reason);
                 showChallenge();
             }
-            
-            // Draw face mesh contours in Red when drowsy
+
             drawFaceMeshMesh(landmarks, "rgba(255, 0, 85, 0.35)");
         } else {
+            // Eyes are open: reset the microsleep counter. Non-closure signals
+            // (yawn / tilt / looking down / rubbing) surface only as warnings.
             consecutiveDrowsyFrames = 0;
-            statusText.innerText = "Monitoring";
-            statusLight.className = "light green";
-            overlayMessage.classList.add('hidden');
-            
-            // Draw face mesh in cool cyan when awake
-            drawFaceMeshMesh(landmarks, "rgba(0, 242, 234, 0.3)");
+
+            let warnReason = "";
+            if (isYawning) warnReason = "Yawning";
+            else if (isTilted) warnReason = "Head Tilted";
+            else if (isRubbing) warnReason = "Eye Rubbing";
+            else if (isLookingDown) warnReason = "Looking Down";
+
+            if (warnReason) {
+                statusText.innerText = `Warning: ${warnReason}`;
+                statusLight.className = "light yellow";
+                speakVoiceWarning(warnReason);
+                drawFaceMeshMesh(landmarks, "rgba(255, 193, 7, 0.30)");
+            } else {
+                statusText.innerText = "Monitoring";
+                statusLight.className = "light green";
+                overlayMessage.classList.add('hidden');
+                drawFaceMeshMesh(landmarks, "rgba(0, 242, 234, 0.3)");
+            }
         }
+
+        // Whether any drowsiness indicator is present (for alertness scoring only)
+        const anyIndicator = eyesClosed || isYawning || isTilted || isRubbing || drowsyNodThisFrame;
         
         // --- CALCULATE LIVE ALERTNESS PERCENT ---
         let liveScore = 100;
@@ -812,10 +870,10 @@ function onFaceResults(results) {
             liveScore = ((avgEAR - DROWSINESS_THRESHOLD) / (maxHealthyEAR - DROWSINESS_THRESHOLD)) * 100;
         }
         
-        // Penalties on alertness score for yawning or tilted head
-        if (isDrowsyThisFrame) {
-            if (frameReason === "Yawning") liveScore = Math.min(25, liveScore);
-            if (frameReason === "Head Tilted" || frameReason === "Head Nodding") liveScore = Math.min(20, liveScore);
+        // Penalties on alertness score for warning-level indicators
+        if (anyIndicator) {
+            if (isYawning) liveScore = Math.min(25, liveScore);
+            if (isTilted || drowsyNodThisFrame) liveScore = Math.min(20, liveScore);
         }
         
         // Add current reading to history for end statistics average
@@ -855,9 +913,9 @@ function speakVoiceWarning(reason) {
     lastSpokenTime = now;
     
     let speechText = "Warning. Drowsiness detected.";
-    if (reason === "Eyes Closed") speechText = "Attention. Please keep your eyes open.";
+    if (reason === "Eyes Closed" || reason === "Eyes Closing") speechText = "Attention. Please keep your eyes open.";
     if (reason === "Yawning") speechText = "Alert. Take a deep breath or stretch.";
-    if (reason === "Head Tilted" || reason === "Head Nodding") speechText = "Warning. Raise your head.";
+    if (reason === "Head Tilted" || reason === "Looking Down") speechText = "Warning. Raise your head.";
     if (reason === "Eye Rubbing") speechText = "Avoid rubbing your eyes. You are fatigued.";
     
     if ('speechSynthesis' in window) {
@@ -966,6 +1024,15 @@ startBtn.addEventListener('click', async () => {
         focusScore = 100;
         alertnessHistory = [];
         consecutiveDrowsyFrames = 0;
+
+        // Reset per-session startup markers so timing reflects this Start click
+        liveFirstFrameReceivedLogged = false;
+        liveFirstInferenceLogged = false;
+        liveFirstRenderedFrameLogged = false;
+
+        // Reset nod-velocity tracking state
+        lastPitchRatio = null;
+        lastDrowsyNodFrame = -1000;
         
         logYawnsDisplay.innerText = 0;
         logAlertsDisplay.innerText = 0;
