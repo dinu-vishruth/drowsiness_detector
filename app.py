@@ -1,10 +1,9 @@
 import os
 import csv
 import io
-import secrets
 from functools import wraps
 from datetime import datetime, date, timedelta
-from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, make_response, session
+from flask import Flask, render_template, request, jsonify, redirect, url_for, flash, make_response, abort
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from flask_mail import Mail, Message
 from dotenv import load_dotenv
@@ -12,7 +11,7 @@ from dotenv import load_dotenv
 from reports import generate_pdf_report, generate_csv_report
 from recommendations import analyze_user_sessions
 
-from database import db, User, Session, AlertEvent, Achievement, ACHIEVEMENT_DEFINITIONS, init_db
+from database import db, User, Session, AlertEvent, Achievement, ACHIEVEMENT_DEFINITIONS, init_db, ensure_admin_exists
 
 # Load environment variables from .env file
 load_dotenv()
@@ -62,45 +61,35 @@ def load_user(user_id):
     return User.query.get(int(user_id))
 
 
-# --- ADMIN AUTHENTICATION (environment-based, DB-independent) ---
+# --- ADMIN AUTHORIZATION (database-backed, single-admin) ---
 #
-# Admin credentials are read from environment variables (ADMIN_USERNAME /
-# ADMIN_PASSWORD) and are NEVER stored in the users database table. This keeps
-# the administrator account completely separate from normal application users:
-#   * Env vars keep the secret out of source control and let each deployment
-#     (local .env, EC2 .env, etc.) supply its own credentials without code changes.
-#   * Keeping admin OUT of the database guarantees that registering a normal
-#     user named "admin" can never grant administrative privileges — there is no
-#     database row that admin access is derived from.
-#
-# Admin state is tracked purely through the Flask server-side session flag
-# `admin_logged_in`, which is independent of Flask-Login's user session.
-
-
-def is_admin_logged_in():
-    """Return True only when the current session holds a valid admin flag."""
-    return session.get('admin_logged_in') is True
+# Administrator status lives on the users table as the boolean `is_admin` column.
+# There is exactly ONE admin, created once at startup from ADMIN_USERNAME /
+# ADMIN_PASSWORD (see database.ensure_admin_exists). The admin signs in through
+# the SAME login page as everyone else — there is no separate admin login flow.
+# Authorization is derived solely from `current_user.is_admin`, never from the
+# username or email, and registration can never set this flag.
 
 
 def admin_required(view_func):
-    """Guard admin-only routes.
+    """Guard admin-only routes: 403 for anyone who is not the admin.
 
-    Redirects unauthenticated visitors (including normal logged-in users, who
-    never receive the admin session flag) to the dedicated admin login page.
+    A logged-out visitor is sent to the normal login page; an authenticated but
+    non-admin user is refused with HTTP 403 (authorization, not authentication).
     """
     @wraps(view_func)
+    @login_required
     def wrapper(*args, **kwargs):
-        if not is_admin_logged_in():
-            flash('Please sign in as an administrator to continue.', 'error')
-            return redirect(url_for('admin_login'))
+        if not current_user.is_admin:
+            abort(403)
         return view_func(*args, **kwargs)
     return wrapper
 
 
 @app.context_processor
 def inject_admin_state():
-    """Expose the admin session flag to all templates as `is_admin`."""
-    return {'is_admin': is_admin_logged_in()}
+    """Expose `is_admin` to all templates, driven by the logged-in user."""
+    return {'is_admin': current_user.is_authenticated and current_user.is_admin}
 
 
 @app.before_request
@@ -109,8 +98,9 @@ def track_active_user():
         ACTIVE_USER_IDS.add(current_user.id)
 
 
-# Initialize DB
+# Initialize DB, then guarantee the single administrator exists (idempotent).
 init_db(app)
+ensure_admin_exists(app)
 
 # --- AUTHENTICATION ROUTES ---
 
@@ -138,9 +128,11 @@ def register():
             flash('Username or email already registered.', 'error')
             return redirect(url_for('register'))
             
-        user = User(username=username, email=email)
+        # Registration ALWAYS creates a non-admin. is_admin is never read from
+        # the form, so a crafted request cannot self-promote to administrator.
+        user = User(username=username, email=email, is_admin=False)
         user.set_password(password)
-        
+
         db.session.add(user)
         db.session.commit()
         
@@ -164,6 +156,10 @@ def login():
             login_user(user)
             ACTIVE_USER_IDS.add(user.id)
             flash(f'Welcome back, {user.username}!', 'success')
+            # Admin and normal users share this one login page; the admin is
+            # simply a user whose is_admin flag is True and is sent to the panel.
+            if user.is_admin:
+                return redirect(url_for('admin_panel'))
             return redirect(url_for('dashboard'))
         else:
             flash('Invalid username or password.', 'error')
@@ -171,48 +167,6 @@ def login():
 
     return render_template('login.html', active_page='login')
 
-
-@app.route('/admin/login', methods=['GET', 'POST'])
-def admin_login():
-    # Admin authentication is fully separate from the user login flow above:
-    # it validates against environment variables only and never touches the
-    # users database, so a normal account can never escalate to admin.
-    if is_admin_logged_in():
-        return redirect(url_for('admin_panel'))
-
-    if request.method == 'POST':
-        username = request.form.get('username', '')
-        password = request.form.get('password', '')
-
-        admin_username = os.getenv('ADMIN_USERNAME')
-        admin_password = os.getenv('ADMIN_PASSWORD')
-
-        # Reject if the server has no admin credentials configured, rather than
-        # allowing an empty username/password to authenticate.
-        credentials_configured = bool(admin_username) and bool(admin_password)
-
-        # Use constant-time comparison to avoid leaking credential length/content
-        # through timing. Never log or echo the submitted or expected values.
-        username_ok = credentials_configured and secrets.compare_digest(username, admin_username)
-        password_ok = credentials_configured and secrets.compare_digest(password, admin_password)
-
-        if username_ok and password_ok:
-            session['admin_logged_in'] = True
-            flash('Administrator signed in.', 'success')
-            return redirect(url_for('admin_panel'))
-
-        flash('Invalid username or password.', 'error')
-        return redirect(url_for('admin_login'))
-
-    return render_template('admin_login.html', active_page='admin_login')
-
-
-@app.route('/admin/logout')
-def admin_logout():
-    # Clear only the admin flag so any separate user login remains untouched.
-    session.pop('admin_logged_in', None)
-    flash('Administrator signed out.', 'success')
-    return redirect(url_for('admin_login'))
 
 @app.route('/logout')
 @login_required
@@ -418,7 +372,7 @@ def monitor():
 @login_required
 def session_detail(session_id):
     session_obj = Session.query.get_or_404(session_id)
-    if session_obj.user_id != current_user.id and not is_admin_logged_in():
+    if session_obj.user_id != current_user.id and not current_user.is_admin:
         flash('Unauthorized access to session details.', 'error')
         return redirect(url_for('dashboard'))
         
@@ -643,7 +597,7 @@ def api_end_session():
 @login_required
 def export_csv(session_id):
     sess = Session.query.get_or_404(session_id)
-    if sess.user_id != current_user.id and not is_admin_logged_in():
+    if sess.user_id != current_user.id and not current_user.is_admin:
         flash('Unauthorized access.', 'error')
         return redirect(url_for('dashboard'))
 
@@ -659,7 +613,7 @@ def export_csv(session_id):
 @login_required
 def export_pdf(session_id):
     sess = Session.query.get_or_404(session_id)
-    if sess.user_id != current_user.id and not is_admin_logged_in():
+    if sess.user_id != current_user.id and not current_user.is_admin:
         flash('Unauthorized access.', 'error')
         return redirect(url_for('dashboard'))
 

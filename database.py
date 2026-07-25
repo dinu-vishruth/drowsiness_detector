@@ -145,6 +145,8 @@ def init_db(app):
     db.init_app(app)
     with app.app_context():
         db.create_all()
+        # Non-destructive migration: add the is_admin column to pre-existing
+        # databases without dropping data or requiring users to re-register.
         inspector = db.inspect(db.engine)
         existing_columns = {col['name'] for col in inspector.get_columns('users')}
         if 'is_admin' not in existing_columns:
@@ -153,3 +155,47 @@ def init_db(app):
             else:
                 db.session.execute(text('ALTER TABLE users ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE'))
             db.session.commit()
+
+
+def ensure_admin_exists(app):
+    """Guarantee exactly one administrator exists, created from environment vars.
+
+    Runs on every startup and is fully idempotent:
+      * If ANY admin already exists, does nothing (never creates a second admin).
+      * Otherwise, promotes an existing user whose username/email matches the
+        configured admin identity (without touching their password), or creates
+        a fresh admin with a hashed ADMIN_PASSWORD.
+
+    Because it only ever acts when zero admins exist, re-running it — or editing
+    ADMIN_PASSWORD in .env later — never overwrites the live admin's password.
+    """
+    with app.app_context():
+        # Requirement: at most one admin, ever. If one is already present we are
+        # done regardless of what the environment currently says.
+        if User.query.filter_by(is_admin=True).first() is not None:
+            return
+
+        admin_username = os.getenv('ADMIN_USERNAME')
+        admin_password = os.getenv('ADMIN_PASSWORD')
+        admin_email = os.getenv('ADMIN_EMAIL', 'admin@example.com')
+
+        # Without credentials we cannot safely create an admin. Fail closed and
+        # leave the system with no admin rather than a blank-credential account.
+        if not admin_username or not admin_password:
+            return
+
+        # If a user already occupies the configured admin username/email (e.g. the
+        # operator's own pre-existing account), promote them in place instead of
+        # colliding with the UNIQUE constraint. Their password is left untouched.
+        existing = User.query.filter(
+            (User.username == admin_username) | (User.email == admin_email)
+        ).first()
+        if existing is not None:
+            existing.is_admin = True
+            db.session.commit()
+            return
+
+        admin = User(username=admin_username, email=admin_email, is_admin=True)
+        admin.set_password(admin_password)  # hashed via werkzeug generate_password_hash
+        db.session.add(admin)
+        db.session.commit()
