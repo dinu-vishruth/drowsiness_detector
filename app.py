@@ -30,10 +30,16 @@ if database_url:
     else:
         app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 else:
-    # Local development - use absolute path in instance folder
-    instance_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance')
-    os.makedirs(instance_path, exist_ok=True)
-    db_path = os.path.join(instance_path, 'drowsiness.db')
+    # No DATABASE_URL — use SQLite. On Render the source tree (/opt/render/project/src)
+    # is read-only, so the DB file must live on the writable persistent disk
+    # (mounted at /var/data); locally we use the instance/ folder instead.
+    render_disk = os.environ.get('RENDER_DATA_DIR', '/var/data')
+    if os.path.isdir(render_disk):
+        db_dir = render_disk
+    else:
+        db_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'instance')
+    os.makedirs(db_dir, exist_ok=True)
+    db_path = os.path.join(db_dir, 'drowsiness.db')
     app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
