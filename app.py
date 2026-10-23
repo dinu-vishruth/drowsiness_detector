@@ -279,6 +279,10 @@ def index():
         return redirect(url_for('dashboard'))
     return redirect(url_for('login'))
 
+@app.route('/ping')
+def ping():
+    return 'ok'
+
 # --- DASHBOARD & MONITOR ROUTES ---
 
 
